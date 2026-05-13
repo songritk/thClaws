@@ -129,19 +129,36 @@ sudo dnf install wayland libsoup3 webkit2gtk4.1
 
 **Prerequisites:** Rust 1.85+, Node.js 20+, pnpm 9+.
 
+#### Option 1: Full Build (GUI + CLI)
+Requires Node.js and pnpm to build the embedded frontend.
+
 ```sh
 git clone https://github.com/thClaws/thClaws.git
 cd thClaws
 
-# Build frontend (React + Vite, bundled as a single HTML file)
+# 1. Build frontend (React + Vite)
+# This step is REQUIRED for the --features gui build below.
 cd frontend && pnpm install && pnpm build && cd ..
 
-# Build Rust (CLI + GUI)
+# 2. Build Rust binary with GUI features
 cargo build --release --features gui --bin thclaws
+```
 
-# Run
-./target/release/thclaws          # GUI
-./target/release/thclaws --cli    # CLI
+#### Option 2: CLI Only
+No Node.js or pnpm required. Ideal for servers or headless environments.
+
+```sh
+git clone https://github.com/thClaws/thClaws.git
+cd thClaws
+
+# Build Rust binary (CLI only)
+cargo build --release --bin thclaws
+```
+
+#### Run
+```sh
+./target/release/thclaws          # GUI (Full build only)
+./target/release/thclaws --cli    # CLI REPL
 ./target/release/thclaws -p "what does src/main.rs do?"  # one-shot
 ```
 
