@@ -44,7 +44,7 @@ pub mod xlsx_create;
 pub mod xlsx_edit;
 pub mod xlsx_read;
 
-pub use ask::{set_gui_ask_sender, AskUserRequest, AskUserTool};
+pub use ask::{set_gui_ask_sender, set_line_driven_turn, AskUserRequest, AskUserTool};
 pub use bash::BashTool;
 pub use docx_create::DocxCreateTool;
 pub use docx_edit::DocxEditTool;

@@ -291,17 +291,17 @@ impl ApprovalSink for LineApprover {
             pending.insert(request_id.clone(), tx);
         }
 
-        // Send the prompt. We do this through the *relay's* reply
-        // endpoint by reusing the same request id — that path is
-        // already authenticated via the JWT and falls back to push
-        // when the reply window has elapsed.
+        // Send the prompt. Approval prompts are unsolicited — there
+        // is NO inbound webhook event corresponding to this agent
+        // initiative, so `/reply/:id` would 404 (no cached
+        // replyToken). Use `/push` instead; the relay reads the
+        // recipient from the JWT's `sub`. This costs against the
+        // channel push quota but is unavoidable for unsolicited
+        // messages — see `line-bridge.md` §implementer guidance.
         if let Some(client) = &self.client {
             let prompt = Self::build_prompt(req);
             let buttons = Self::build_buttons(&request_id);
-            if let Err(e) = client
-                .send_reply_with_buttons(&request_id, prompt, buttons)
-                .await
-            {
+            if let Err(e) = client.push_with_buttons(prompt, buttons).await {
                 eprintln!("[line] approval prompt failed to send: {e}; auto-denying");
                 // Clean up the dangling pending entry.
                 self.record_decision_by_id(&request_id, ApprovalDecision::Deny);
@@ -327,10 +327,10 @@ impl ApprovalSink for LineApprover {
                 }
                 if let Some(client) = &self.client {
                     let _ = client
-                        .send_reply(
-                            &request_id,
-                            format!("⏰ Approval for {} timed out; auto-denied.", req.tool_name),
-                        )
+                        .push(format!(
+                            "⏰ Approval for {} timed out; auto-denied.",
+                            req.tool_name
+                        ))
                         .await;
                 }
                 ApprovalDecision::Deny

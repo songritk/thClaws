@@ -79,10 +79,7 @@ impl LineSession {
         let client = Arc::try_unwrap(self.client)
             .map(|c| c.with_cancel(token.clone()))
             .unwrap_or_else(|arc| {
-                let cfg = LineConfig {
-                    binding_token: String::new(),
-                    server_url: None,
-                };
+                let cfg = LineConfig::default();
                 // Should never hit this branch — `new` is the
                 // only constructor — but fail-safe rather than
                 // unwrap-panic.
@@ -123,42 +120,43 @@ impl LineEnvelopeSink for SessionSink {
                     text.chars().count(),
                     request_id
                 );
-                // If an approval is waiting on a reply, the next
-                // inbound text is interpreted as that answer
-                // *first* — don't drop the message into a new
-                // agent turn while a tool dispatch is suspended
-                // on `oneshot::Receiver`. An `Unrecognised` reply
-                // re-prompts via the relay; anything that parses
-                // resolves the pending decision and skips the
-                // agent loop for this turn.
+                // C2 fix: NEVER block this method on the agent
+                // turn. The WS recv loop in `LineClient` awaits
+                // `on_envelope` in line, so an agent turn that
+                // pauses on an approval prompt would deadlock the
+                // delivery of the very Postback that would resolve
+                // it. Each `UserMessage` spawns a detached task —
+                // the worker channel still serialises turns at the
+                // ShellInput layer, so concurrent agent execution
+                // isn't a concern.
+                //
+                // The approval-text short-circuit runs synchronously
+                // BEFORE the spawn so a `record_decision_from_text`
+                // race doesn't leak into a half-spawned turn — but
+                // its outbound `send_reply` confirmation also gets
+                // spawned to keep `on_envelope` non-blocking.
+
                 if let Some(approver) = &self.approver {
                     if approver.has_pending() {
                         match approver.record_decision_from_text(&text) {
-                            Some(ApprovalReply::Allow) => {
-                                let _ = self
-                                    .client
-                                    .send_reply(&request_id, "✅ Approved — running tool now.")
-                                    .await;
-                                return;
-                            }
-                            Some(ApprovalReply::Deny) => {
-                                let _ = self
-                                    .client
-                                    .send_reply(
-                                        &request_id,
-                                        "🚫 Denied — agent will not run the tool.",
-                                    )
-                                    .await;
-                                return;
-                            }
-                            Some(ApprovalReply::Unrecognised) => {
-                                let _ = self
-                                    .client
-                                    .send_reply(
-                                        &request_id,
-                                        "I didn't catch that. Please reply 'approve' or 'deny'.",
-                                    )
-                                    .await;
+                            Some(reply_kind) => {
+                                let msg = match reply_kind {
+                                    ApprovalReply::Allow => "✅ Approved — running tool now.",
+                                    ApprovalReply::Deny => {
+                                        "🚫 Denied — agent will not run the tool."
+                                    }
+                                    ApprovalReply::Unrecognised => {
+                                        "I didn't catch that. Please reply 'approve' or 'deny'."
+                                    }
+                                };
+                                let client = self.client.clone();
+                                let request_id = request_id.clone();
+                                let msg = msg.to_string();
+                                tokio::spawn(async move {
+                                    if let Err(e) = client.send_reply(&request_id, msg).await {
+                                        eprintln!("[line] approval confirm reply failed: {e}");
+                                    }
+                                });
                                 return;
                             }
                             None => {
@@ -171,25 +169,37 @@ impl LineEnvelopeSink for SessionSink {
                     }
                 }
 
-                if let Some(reply) = self.handler.handle_message(text).await {
-                    let body = filter_for_line(&reply);
-                    if let Err(e) = self.client.send_reply(&request_id, body).await {
-                        eprintln!("[line] reply failed (request_id={}): {}", request_id, e);
+                let handler = self.handler.clone();
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    if let Some(reply) = handler.handle_message(text).await {
+                        let body = filter_for_line(&reply);
+                        if let Err(e) = client.send_reply(&request_id, body).await {
+                            eprintln!("[line] reply failed (request_id={}): {}", request_id, e);
+                        }
                     }
-                }
+                });
             }
             WsEnvelope::Postback { data } => {
                 eprintln!("[line] postback: {data}");
-                // Phase 1.2.b path — once the relay forwards Quick
-                // Reply taps as `tool:<verb>:<id>` postbacks, this
-                // resolves the matching pending approval *before*
-                // the generic handler sees the postback.
+                // Postback resolution is sync (just resolves a
+                // oneshot via `record_decision_from_postback`), so
+                // we don't need to spawn here. Returning quickly
+                // is critical: this is the path that UNBLOCKS the
+                // approval-waiting agent turn.
                 if let Some(approver) = &self.approver {
                     if approver.record_decision_from_postback(&data).is_some() {
                         return;
                     }
                 }
-                self.handler.handle_postback(data).await;
+                // No pending approval matched — give the handler a
+                // chance. Default impl is a no-op; spawn so an
+                // implementer's async work can't reintroduce the
+                // deadlock either.
+                let handler = self.handler.clone();
+                tokio::spawn(async move {
+                    handler.handle_postback(data).await;
+                });
             }
             WsEnvelope::Notice { text } => {
                 // Surface as a regular eprintln — Phase 1.3 GUI

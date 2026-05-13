@@ -33,7 +33,7 @@ pub enum LineConfigError {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LineConfig {
     /// HS256 JWT issued by the relay's `POST /pair`.
     pub binding_token: String,
@@ -41,6 +41,16 @@ pub struct LineConfig {
     /// `$THCLAWS_LINE_SERVER` or `DEFAULT_SERVER_URL`.
     #[serde(default)]
     pub server_url: Option<String>,
+    /// LINE display name cached at pair time. `None` when the
+    /// relay couldn't fetch it (rate limit / older relay version).
+    /// Surfaced to the GUI via the `line_status` broadcast for the
+    /// sidebar pill label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 impl LineConfig {
@@ -149,6 +159,27 @@ impl LineConfig {
             urlencoding::encode(request_id)
         )
     }
+
+    /// Build the absolute `POST /unpair` URL.
+    pub fn unpair_url(&self) -> String {
+        format!("{}/unpair", self.resolved_server_url())
+    }
+
+    /// Build the absolute `POST /push` URL. Used for unsolicited
+    /// messages from thClaws — approval prompts, timeout notices.
+    /// `/reply/:id` is the wrong primitive for these because there's
+    /// no inbound webhook event to provide a `replyToken`.
+    pub fn push_url(&self) -> String {
+        format!("{}/push", self.resolved_server_url())
+    }
+
+    /// Build the absolute `POST /chat-bridge/event` URL. Used to
+    /// fan out per-turn `ViewEvent`s (assistant text deltas, tool
+    /// call indicators, turn-done) to the plan-10 browser chat
+    /// when it's connected.
+    pub fn chat_bridge_event_url(&self) -> String {
+        format!("{}/chat-bridge/event", self.resolved_server_url())
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +192,7 @@ mod tests {
         let mut c = LineConfig {
             binding_token: "t".into(),
             server_url: Some("https://custom.example/".into()),
+            ..Default::default()
         };
         assert_eq!(c.resolved_server_url(), "https://custom.example");
 
@@ -178,6 +210,7 @@ mod tests {
         let c = LineConfig {
             binding_token: "abc".into(),
             server_url: Some("https://line.thclaws.ai".into()),
+            ..Default::default()
         };
         assert_eq!(c.ws_url(), "wss://line.thclaws.ai/ws?token=abc");
     }
@@ -187,6 +220,7 @@ mod tests {
         let c = LineConfig {
             binding_token: "abc".into(),
             server_url: Some("http://localhost:8080".into()),
+            ..Default::default()
         };
         assert_eq!(c.ws_url(), "ws://localhost:8080/ws?token=abc");
     }
@@ -196,6 +230,7 @@ mod tests {
         let c = LineConfig {
             binding_token: "t".into(),
             server_url: Some("https://line.thclaws.ai".into()),
+            ..Default::default()
         };
         // Spaces / slashes in a request_id are rare but possible
         // for synthesized uuids on weird platforms; URL-escape

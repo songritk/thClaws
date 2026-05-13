@@ -101,6 +101,104 @@ impl LineClient {
         .await
     }
 
+    /// Send an unsolicited push message to the bound LINE user.
+    /// Used for the approval prompt and timeout notices fired by
+    /// `LineApprover` — these have no inbound webhook event, so
+    /// `/reply/:id` would 404. `/push` reads the recipient from the
+    /// JWT's `sub` claim and calls LINE's push API directly. Costs
+    /// against the channel's monthly push quota — keep usage to
+    /// genuinely unsolicited messages (approvals + errors), use
+    /// `send_reply` for replies to incoming user messages.
+    pub async fn push(&self, text: impl Into<String>) -> Result<(), LineClientError> {
+        self.push_inner(ReplyBody {
+            text: text.into(),
+            quick_reply: None,
+        })
+        .await
+    }
+
+    /// Push variant with Quick Reply chips, same wire shape as
+    /// `send_reply_with_buttons`.
+    pub async fn push_with_buttons(
+        &self,
+        text: impl Into<String>,
+        buttons: Vec<QuickReplyButton>,
+    ) -> Result<(), LineClientError> {
+        self.push_inner(ReplyBody {
+            text: text.into(),
+            quick_reply: Some(buttons),
+        })
+        .await
+    }
+
+    async fn push_inner(&self, body: ReplyBody) -> Result<(), LineClientError> {
+        let url = self.config.push_url();
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.config.binding_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LineClientError::ReplyHttp(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LineClientError::ReplyStatus { status, body });
+        }
+        Ok(())
+    }
+
+    /// Push a single browser-chat `ViewEvent` to the relay's
+    /// fan-out endpoint. The relay routes to `Channel::Browser`
+    /// via the broker — if no browser is currently connected,
+    /// the route is a silent drop. Best-effort: a network error
+    /// is logged at the caller; we don't retry.
+    ///
+    /// The `event` value is the JSON envelope the browser SPA
+    /// dispatches by `type` — `assistant_delta`, `tool_call_start`,
+    /// `turn_done`, etc. The relay doesn't introspect.
+    pub async fn push_chat_event(&self, event: serde_json::Value) -> Result<(), LineClientError> {
+        let url = self.config.chat_bridge_event_url();
+        let body = serde_json::json!({ "event": event });
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.config.binding_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LineClientError::ReplyHttp(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LineClientError::ReplyStatus { status, body });
+        }
+        Ok(())
+    }
+
+    /// Tell the relay to drop our binding. Used by the GUI's
+    /// "Disconnect" path — without this, the server still thinks
+    /// the user is paired and routes their next LINE message into
+    /// a dead WS (silent drop). Best-effort: a network failure
+    /// here doesn't block the local cleanup.
+    pub async fn unpair(&self) -> Result<(), LineClientError> {
+        let url = self.config.unpair_url();
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.config.binding_token)
+            .send()
+            .await
+            .map_err(|e| LineClientError::ReplyHttp(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LineClientError::ReplyStatus { status, body });
+        }
+        Ok(())
+    }
+
     async fn send_reply_inner(
         &self,
         request_id: &str,

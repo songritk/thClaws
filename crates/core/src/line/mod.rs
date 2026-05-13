@@ -42,6 +42,6 @@ pub use approver::{ApprovalReply, LineApprover};
 pub use bootstrap::{LineSessionHandle, LineStatus};
 pub use client::{LineClient, LineClientError};
 pub use config::{LineConfig, LineConfigError};
-pub use filter::filter_for_line;
+pub use filter::{clean_for_stream, filter_for_line};
 pub use protocol::{WsEnvelope, WsIncoming};
 pub use session::LineSession;

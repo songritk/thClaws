@@ -9,6 +9,12 @@ type LineStatus = {
   state: "connected" | "disconnected";
   server_url: string;
   pending_approvals: number;
+  /// LINE display name from the relay's `/pair` response. Shown
+  /// next to the pill dot when present; falls back to "bridge live"
+  /// when the relay didn't return one (older relay or LINE API
+  /// fetch failure).
+  display_name?: string;
+  picture_url?: string;
 };
 
 // Confirmation dialog with two backends. Mirrors `platformConfirm`
@@ -150,6 +156,8 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
           state: (msg.state as LineStatus["state"]) ?? "disconnected",
           server_url: (msg.server_url as string) ?? "",
           pending_approvals: (msg.pending_approvals as number) ?? 0,
+          display_name: (msg.display_name as string | undefined) ?? undefined,
+          picture_url: (msg.picture_url as string | undefined) ?? undefined,
         });
       }
     });
@@ -285,27 +293,39 @@ export function Sidebar({ onBrowseKms }: SidebarProps = {}) {
         <Section title="LINE">
           <div
             className="px-2 py-1 flex items-center gap-1.5"
-            title={`Bridge live · ${lineStatus.server_url}${lineStatus.pending_approvals > 0 ? ` · ${lineStatus.pending_approvals} pending` : ""}`}
+            title={`${lineStatus.display_name ? `${lineStatus.display_name} · ` : ""}${lineStatus.server_url}${lineStatus.pending_approvals > 0 ? ` · ${lineStatus.pending_approvals} pending` : ""}`}
           >
+            {lineStatus.picture_url ? (
+              <img
+                src={lineStatus.picture_url}
+                alt=""
+                className="w-4 h-4 rounded-full shrink-0"
+                style={{ objectFit: "cover" }}
+              />
+            ) : (
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{
+                  background:
+                    lineStatus.pending_approvals > 0
+                      ? "var(--warning, #d19a66)"
+                      : "var(--accent)",
+                }}
+                aria-hidden
+              />
+            )}
             <span
-              className="w-1.5 h-1.5 rounded-full"
-              style={{
-                background:
-                  lineStatus.pending_approvals > 0
-                    ? "var(--warning, #d19a66)"
-                    : "var(--accent)",
-              }}
-              aria-hidden
-            />
-            <span style={{ color: "var(--text-primary)" }}>
-              bridge live
+              className="truncate"
+              style={{ color: "var(--text-primary)" }}
+            >
+              {lineStatus.display_name ?? "bridge live"}
             </span>
             {lineStatus.pending_approvals > 0 && (
               <span
                 className="ml-auto"
-                style={{ color: "var(--text-secondary)", fontSize: "10px" }}
+                style={{ color: "var(--warning, #d19a66)", fontSize: "10px" }}
               >
-                {lineStatus.pending_approvals} pending
+                {lineStatus.pending_approvals}
               </span>
             )}
           </div>

@@ -1341,6 +1341,23 @@ async fn run_worker(
         ));
         factory
     };
+    // Apply `disallowed_tools` to the main agent's registry. Until
+    // this was wired, the config field was parsed (config.rs maps
+    // both flat `disallowedTools` and nested `permissions.deny`)
+    // but ignored — only `subagent.rs` honored it. The user's
+    // `disallowedTools: ["AskUserQuestion"]` setting now actually
+    // takes effect on the main loop too.
+    if let Some(denied) = &config.disallowed_tools {
+        for name in denied {
+            tools.remove(name);
+        }
+        if !denied.is_empty() {
+            eprintln!(
+                "[config] main agent disallowed_tools applied: {}",
+                denied.join(", ")
+            );
+        }
+    }
     let mut agent = Agent::new(provider, tools.clone(), &config.model, &system)
         .with_max_tokens(config.max_tokens)
         .with_approver(approver.clone())
@@ -1790,14 +1807,30 @@ async fn run_worker(
                     // we want to keep so LineDisconnect lands
                     // back on the user's pre-LINE posture.
                 }
+                // Stash profile fields before we move `line_cfg`
+                // into `bootstrap::spawn` — they go on the
+                // `line_status` broadcast so the GUI sidebar pill
+                // can render the display name + avatar.
+                let pair_display_name = line_cfg.display_name.clone();
+                let pair_picture_url = line_cfg.picture_url.clone();
                 let handle = crate::line::bootstrap::spawn(line_cfg, input_tx_self.clone());
 
                 // Plan-07 Phase 2.1: swap permission posture to
                 // route approvals through LINE while the bridge
                 // is connected. Stash the pre-existing values so
                 // LineDisconnect can put them back.
+                //
+                // Critical: stash the *AGENT's* permission_mode,
+                // not the global. `rebuild_agent` preserves
+                // `agent.permission_mode` (line 611+627); if we
+                // only update the global via
+                // `set_current_mode_and_broadcast`, the agent
+                // stays in its prior mode (typically `Auto`) and
+                // `agent.permission_mode.asks_for_approval()`
+                // returns false → mutating tools run silently.
+                // This was C3 from the post-deploy audit.
                 if state.line_pre_mode.is_none() {
-                    state.line_pre_mode = Some(crate::permissions::current_mode());
+                    state.line_pre_mode = Some(state.agent.permission_mode);
                     state.line_pre_approver = Some(state.approver.clone());
                 }
                 crate::permissions::set_current_mode_and_broadcast(
@@ -1808,12 +1841,19 @@ async fn run_worker(
                 if let Err(e) = state.rebuild_agent(true) {
                     eprintln!("[line] rebuild_agent after mode swap failed: {e}");
                 }
+                // Force the rebuilt agent into LineGated. Without
+                // this, `rebuild_agent`'s prev_perm restore puts
+                // the agent back into whatever mode it was in
+                // before the connect.
+                state.agent.permission_mode = crate::permissions::PermissionMode::LineGated;
 
                 let payload = serde_json::json!({
                     "type": "line_status",
                     "state": handle.status.state,
                     "server_url": handle.status.server_url,
                     "pending_approvals": handle.status.pending_approvals,
+                    "display_name": pair_display_name,
+                    "picture_url": pair_picture_url,
                 });
                 state.line_session = Some(handle);
                 let _ = events_tx.send(ViewEvent::LineStatus(payload.to_string()));
@@ -1822,15 +1862,35 @@ async fn run_worker(
                 ));
             }
             ShellInput::LineDisconnect => {
+                // Tell the relay to drop our binding BEFORE we cancel
+                // the WS / delete the on-disk JWT. Without this the
+                // server still thinks the user is paired and would
+                // route their next LINE message into a dead WS;
+                // worse, the user couldn't re-pair until the 30-day
+                // binding TTL expired. Best-effort — log a network
+                // failure but continue with local cleanup; the
+                // server's presence check will fall back to issuing
+                // a fresh code when the user next messages the OA.
+                if let Ok(Some(cfg)) = crate::line::LineConfig::load() {
+                    let client = crate::line::LineClient::new(cfg);
+                    tokio::spawn(async move {
+                        if let Err(e) = client.unpair().await {
+                            eprintln!("[line] /unpair failed (continuing): {e}");
+                        }
+                    });
+                }
                 if let Some(handle) = state.line_session.take() {
                     handle.cancel.cancel();
                 }
                 // Plan-07 Phase 2.1: restore the pre-connect mode
                 // + approver so the local Ask/Auto/Plan posture
                 // resumes immediately. No-op if no stash exists
-                // (shouldn't happen, but defensively safe).
+                // (shouldn't happen, but defensively safe). Same
+                // C3 fix as LineConnect — restore on the AGENT's
+                // permission_mode, not just the global.
                 if let Some(prev_mode) = state.line_pre_mode.take() {
                     crate::permissions::set_current_mode_and_broadcast(prev_mode);
+                    state.agent.permission_mode = prev_mode;
                 }
                 if let Some(prev_approver) = state.line_pre_approver.take() {
                     state.approver = prev_approver;
@@ -1867,6 +1927,14 @@ async fn run_worker(
                 // itself goes through the existing `handle_line`
                 // path so slash / bang / goal intercepts behave
                 // identically to GUI-driven prompts.
+                //
+                // Plan-10 Phase 2: simultaneously fan each event
+                // to `/chat-bridge/event` on the relay so a
+                // browser chat (if connected) sees the streaming
+                // reply. Server-side, the broker drops the message
+                // when no browser is connected — so the fan-out
+                // is harmless overhead for OA-only users.
+                let bridge_client = state.line_session.as_ref().map(|s| s.client.clone());
                 let mut event_rx = events_tx.subscribe();
                 let collector = tokio::spawn(async move {
                     // Plan-07 Phase 2.2: capture only the FINAL
@@ -1879,6 +1947,19 @@ async fn run_worker(
                     // when LineGated mode is active.
                     let mut buf = String::new();
                     while let Ok(ev) = event_rx.recv().await {
+                        // Plan-10 fan-out (browser chat). Spawned
+                        // detached so HTTP latency doesn't slow
+                        // event accumulation for the OA path.
+                        if let Some(client) = &bridge_client {
+                            if let Some(envelope) = view_event_to_chat_envelope(&ev) {
+                                let c = client.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = c.push_chat_event(envelope).await {
+                                        eprintln!("[line] chat-bridge push failed: {e}");
+                                    }
+                                });
+                            }
+                        }
                         match ev {
                             ViewEvent::AssistantTextDelta(s) => buf.push_str(&s),
                             ViewEvent::ToolCallStart { .. } => buf.clear(),
@@ -1901,7 +1982,14 @@ async fn run_worker(
                     }
                     buf
                 });
+                // Mark this turn as LINE-driven so AskUserQuestion
+                // short-circuits with a "please ask in your reply"
+                // message instead of routing to a GUI modal the
+                // user can't see. Cleared after the turn finishes
+                // — back-to-back GUI turns then behave normally.
+                crate::tools::ask::set_line_driven_turn(true);
                 handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+                crate::tools::ask::set_line_driven_turn(false);
                 let final_text = collector.await.unwrap_or_default();
                 let _ = respond.send(final_text);
             }
@@ -3416,6 +3504,46 @@ fn sanitize_label_field(s: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Translate the worker's `ViewEvent` into the chat envelope
+/// shape the plan-10 browser SPA expects. Subset of all events —
+/// only the ones that drive the user-visible chat (text deltas,
+/// tool indicators, turn boundary, errors). Returns `None` for
+/// events the browser doesn't render (PlanUpdate, KmsUpdate, etc.).
+fn view_event_to_chat_envelope(ev: &ViewEvent) -> Option<serde_json::Value> {
+    use serde_json::json;
+    match ev {
+        ViewEvent::AssistantTextDelta(text) => {
+            // Apply the same ANSI + tool-narration strip the LINE
+            // OA path uses, otherwise the model's echoed
+            // `\x1b[2m🔧 [Bash]\x1b[0m` indicators leak into the
+            // browser bubble verbatim. `clean_for_stream` is the
+            // truncate-free variant suitable for per-chunk
+            // streaming.
+            let cleaned = crate::line::clean_for_stream(text);
+            // After cleaning, a chunk might be entirely whitespace
+            // or empty (e.g. it contained ONLY a tool-narration
+            // line). Skip so the browser doesn't render a blank.
+            if cleaned.trim().is_empty() {
+                return None;
+            }
+            Some(json!({ "type": "assistant_delta", "text": cleaned }))
+        }
+        ViewEvent::ToolCallStart { name, label, .. } => Some(json!({
+            "type": "tool_call_start",
+            "name": name,
+            "label": label,
+        })),
+        ViewEvent::ToolCallResult { name, output, .. } => Some(json!({
+            "type": "tool_call_result",
+            "name": name,
+            "output": output,
+        })),
+        ViewEvent::TurnDone => Some(json!({ "type": "turn_done" })),
+        ViewEvent::ErrorText(text) => Some(json!({ "type": "error", "text": text })),
+        _ => None,
+    }
 }
 
 fn format_tool_label(name: &str, input: &serde_json::Value) -> String {

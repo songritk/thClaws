@@ -597,15 +597,23 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             // "is the WS task running RIGHT NOW", but for first-
             // paint we only need "is this install paired?", which
             // is a cheap file existence check.
-            let (state_str, server_url) = match crate::line::LineConfig::load() {
-                Ok(Some(cfg)) => ("connected".to_string(), cfg.resolved_server_url()),
-                _ => ("disconnected".to_string(), String::new()),
-            };
+            let (state_str, server_url, display_name, picture_url) =
+                match crate::line::LineConfig::load() {
+                    Ok(Some(cfg)) => (
+                        "connected".to_string(),
+                        cfg.resolved_server_url(),
+                        cfg.display_name.clone(),
+                        cfg.picture_url.clone(),
+                    ),
+                    _ => ("disconnected".to_string(), String::new(), None, None),
+                };
             let payload = serde_json::json!({
                 "type": "line_status",
                 "state": state_str,
                 "server_url": server_url,
                 "pending_approvals": 0,
+                "display_name": display_name,
+                "picture_url": picture_url,
             });
             (ctx.dispatch)(payload.to_string());
         }
@@ -677,11 +685,18 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                     (dispatch)(payload.to_string());
                     return;
                 }
-                // Expected shape: {token, line_user_id, expires_at}
-                let parsed: Result<serde_json::Value, _> = serde_json::from_str(&response_text);
+                // Expected shape:
+                //   {token, line_user_id, expires_at,
+                //    display_name?, picture_url?, language?}
+                // Profile fields are optional — older relays don't
+                // send them; relay also omits when LINE API fetch
+                // failed.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&response_text).unwrap_or(serde_json::Value::Null);
                 let token = parsed
-                    .ok()
-                    .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(String::from));
+                    .get("token")
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
                 let token = match token {
                     Some(t) if !t.is_empty() => t,
                     _ => {
@@ -694,9 +709,18 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                         return;
                     }
                 };
+                let pick_str = |key: &str| -> Option<String> {
+                    parsed.get(key).and_then(|v| v.as_str()).map(String::from)
+                };
+                let display_name = pick_str("display_name");
+                let picture_url = pick_str("picture_url");
+                let language = pick_str("language");
                 let cfg = crate::line::LineConfig {
                     binding_token: token,
                     server_url: Some(server_url.clone()),
+                    display_name: display_name.clone(),
+                    picture_url: picture_url.clone(),
+                    language,
                 };
                 if let Err(e) = cfg.save() {
                     let payload = serde_json::json!({

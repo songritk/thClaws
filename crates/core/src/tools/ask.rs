@@ -2,7 +2,7 @@ use super::{req_str, Tool};
 use crate::error::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -26,6 +26,23 @@ pub struct AskUserRequest {
 static NEXT_ASK_ID: AtomicU64 = AtomicU64::new(1);
 static GUI_ASK_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<AskUserRequest>>>> =
     OnceLock::new();
+
+/// Plan-07 follow-up: when the active turn was driven by LINE,
+/// the GUI Chat tab is somewhere the user can't see (different
+/// device, different room). Routing the AskUserQuestion modal
+/// there would hang the LINE conversation. The worker sets this
+/// flag at the top of each LINE-driven turn and clears it after,
+/// so AskUserQuestion can short-circuit with a message that
+/// teaches the model to ask in its reply text instead.
+static LINE_DRIVEN_TURN: AtomicBool = AtomicBool::new(false);
+
+pub fn set_line_driven_turn(active: bool) {
+    LINE_DRIVEN_TURN.store(active, Ordering::Relaxed);
+}
+
+fn is_line_driven_turn() -> bool {
+    LINE_DRIVEN_TURN.load(Ordering::Relaxed)
+}
 
 pub fn set_gui_ask_sender(sender: Option<mpsc::UnboundedSender<AskUserRequest>>) {
     let slot = GUI_ASK_SENDER.get_or_init(|| Mutex::new(None));
@@ -80,6 +97,20 @@ impl Tool for AskUserTool {
 
     async fn call(&self, input: Value) -> Result<String> {
         let question = req_str(&input, "question")?.to_string();
+        // Plan-07 follow-up: LINE-driven turn. The user is on
+        // their phone via LINE; routing the question through the
+        // GUI Chat tab modal (`gui_ask_sender`) would silently
+        // hang the LINE conversation because the prompt lands on
+        // a screen they can't see. Short-circuit with a polite
+        // message telling the model to fold the question into its
+        // reply text — the user's next LINE message becomes the
+        // answer naturally.
+        if is_line_driven_turn() {
+            return Ok(format!(
+                "(user is on LINE — please rephrase \"{question}\" as part of your reply text; \
+                 their next LINE message will be the answer)"
+            ));
+        }
         if let Some(sender) = gui_ask_sender() {
             let id = NEXT_ASK_ID.fetch_add(1, Ordering::Relaxed);
             let (response, answer_rx) = oneshot::channel();
@@ -144,8 +175,14 @@ mod tests {
     use super::*;
     use crate::tools::Tool;
 
+    /// Both tests in this module mutate `GUI_ASK_SENDER` +
+    /// `LINE_DRIVEN_TURN` globals; rust's default parallel test
+    /// runner would race them. Serialize via a shared mutex.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn gui_ask_sender_round_trips_answer() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (sender, mut requests) = mpsc::unbounded_channel();
         set_gui_ask_sender(Some(sender));
 
@@ -161,6 +198,32 @@ mod tests {
         req.response.send("yes".to_string()).expect("send response");
 
         assert_eq!(pending.await.expect("join ask"), "yes");
+        set_gui_ask_sender(None);
+    }
+
+    #[tokio::test]
+    async fn line_driven_turn_short_circuits_without_gui_modal() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Simulate "GUI is bound but user is on LINE": gui sender
+        // IS registered (paired thClaws install always has it),
+        // but the LINE-driven flag must take precedence so the
+        // turn doesn't hang on a modal the user can't see.
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        set_gui_ask_sender(Some(sender));
+        set_line_driven_turn(true);
+
+        let result = AskUserTool
+            .call(json!({ "question": "Which file?" }))
+            .await
+            .expect("ask call");
+
+        // Model gets a hint to rephrase, not a hang or modal route.
+        assert!(result.contains("LINE"), "got: {result}");
+        assert!(result.contains("Which file?"), "got: {result}");
+        // GUI modal was NOT invoked despite sender being set.
+        assert!(requests.try_recv().is_err(), "GUI modal was invoked");
+
+        set_line_driven_turn(false);
         set_gui_ask_sender(None);
     }
 }

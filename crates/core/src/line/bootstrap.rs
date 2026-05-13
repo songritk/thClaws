@@ -75,6 +75,11 @@ pub struct LineSessionHandle {
     /// holds, so postbacks / text replies resolve the same set
     /// of pending decisions.
     pub approver: Arc<LineApprover>,
+    /// Shared HTTP client for relay-bound calls (push, reply,
+    /// chat-bridge event fan-out). Exposed so the worker's
+    /// LineMessage collector can push `ViewEvent`s to the browser
+    /// chat when it's connected (plan-10 Phase 2).
+    pub client: Arc<LineClient>,
 }
 
 /// Snapshot of the bridge's state. Serialised into the
@@ -157,5 +162,6 @@ pub fn spawn(
         status: LineStatus::connected(server_url),
         join,
         approver,
+        client,
     }
 }
