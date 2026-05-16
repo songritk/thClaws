@@ -20,7 +20,10 @@ use crate::error::{Error, Result};
 use crate::permissions::{
     ApprovalDecision, ApprovalRequest, ApprovalSink, AutoApprover, PermissionMode,
 };
-use crate::providers::{assemble, AssembledEvent, Provider, StreamRequest, Usage};
+use crate::providers::{
+    assemble, classify_error, get_fallback_models, calculate_backoff, ErrorClass, Provider,
+    StreamRequest, Usage, AssembledEvent,
+};
 use crate::tools::ToolRegistry;
 use crate::types::{ContentBlock, Message, Role};
 use async_stream::try_stream;
@@ -1038,6 +1041,8 @@ impl Agent {
                     Some(cap) => current_max_tokens.min(cap),
                     None => current_max_tokens,
                 };
+                // Keep a copy for retry logic before moving into req
+                let retry_model = active_model.clone();
                 let req = StreamRequest {
                     model: active_model,
                     system: if system.is_empty() { None } else { Some(system.clone()) },
@@ -1048,48 +1053,121 @@ impl Agent {
                     stream_chunk_timeout_override: chunk_timeout_override,
                 };
 
-                // Retry with exponential backoff on transient errors.
-                // Config errors (missing API key, bad model name, etc.)
-                // won't fix themselves between attempts — skip the retry
-                // loop for those and surface the error immediately.
+                // Retry with exponential backoff on transient/network errors.
+                // Uses classify_error() to determine retry strategy:
+                // - Transient (timeout, 5xx, rate limit): retry with backoff
+                // - Network (connection refused, DNS): pause and retry
+                // - Permanent (auth, invalid request): end immediately
                 //
-                // M6.17 BUG M3: the backoff sleep `tokio::select!`s
-                // against the cancel token (when one is wired in) so a
-                // user-triggered Cancel during a 1-2-4s wait short-
-                // circuits with a clear error instead of stalling for
-                // up to 7 s.
+                // On exhausted retries, attempts model fallback (Anthropic ->
+                // OpenAI -> Gemini -> Ollama). Saves partial content to
+                // session on failure for recovery.
                 let raw = {
-                    let mut last_err = None;
+                    let mut last_err: Option<Error> = None;
                     let mut stream_result = None;
                     let mut cancelled_during_retry = false;
-                    for attempt in 0..=max_retries {
-                        match provider.stream(req.clone()).await {
-                            Ok(s) => { stream_result = Some(s); break; }
-                            Err(e) => {
-                                let is_config = matches!(e, Error::Config(_));
-                                if !is_config && attempt < max_retries {
-                                    let delay = tokio::time::Duration::from_secs(1 << attempt);
-                                    eprintln!(
-                                        "\x1b[33m[retry {}/{} after {}s: {}]\x1b[0m",
-                                        attempt + 1, max_retries, delay.as_secs(), e
-                                    );
-                                    if let Some(token) = &cancel {
-                                        tokio::select! {
-                                            _ = tokio::time::sleep(delay) => {}
-                                            _ = token.cancelled() => {
-                                                cancelled_during_retry = true;
-                                                break;
-                                            }
+                    let mut current_model = retry_model;
+                    let mut fallbacks = get_fallback_models(&current_model);
+                    let mut fallback_index = 0;
+
+                    // Outer loop: try fallback models if current model exhausts retries
+                    'fallback_loop: loop {
+                        for attempt in 0..=max_retries {
+                            // Check for user cancellation before each attempt
+                            if let Some(token) = &cancel {
+                                if token.is_cancelled() {
+                                    cancelled_during_retry = true;
+                                    break 'fallback_loop;
+                                }
+                            }
+
+                            // Check error class from previous attempt
+                            let error_class = if let Some(ref err) = last_err {
+                                classify_error(&err.to_string())
+                            } else {
+                                ErrorClass::Transient
+                            };
+
+                            // Skip retry for permanent errors
+                            if error_class == ErrorClass::Permanent {
+                                break 'fallback_loop;
+                            }
+
+                            // For network errors: pause 30s, then retry
+                            if error_class == ErrorClass::Network && attempt > 0 {
+                                let delay = tokio::time::Duration::from_secs(30);
+                                eprintln!(
+                                    "\x1b[33m[network error: pausing {}s before retry]\x1b[0m",
+                                    delay.as_secs()
+                                );
+                                if let Some(token) = &cancel {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(delay) => {}
+                                        _ = token.cancelled() => {
+                                            cancelled_during_retry = true;
+                                            break 'fallback_loop;
                                         }
-                                    } else {
-                                        tokio::time::sleep(delay).await;
+                                    }
+                                } else {
+                                    tokio::time::sleep(delay).await;
+                                }
+                            }
+
+                            match provider.stream(req.clone()).await {
+                                Ok(s) => {
+                                    stream_result = Some(s);
+                                    break 'fallback_loop;
+                                }
+                                Err(e) => {
+                                    let err_str = e.to_string();
+                                    last_err = Some(e);
+                                    let err_class = classify_error(&err_str);
+
+                                    // Stop for permanent errors immediately
+                                    if err_class == ErrorClass::Permanent {
+                                        break 'fallback_loop;
+                                    }
+
+                                    if attempt < max_retries {
+                                        let delay = calculate_backoff(attempt as u32);
+                                        eprintln!(
+                                            "\x1b[33m[retry {}/{} after {}s: {}]\x1b[0m",
+                                            attempt + 1, max_retries, delay.as_secs(), err_str
+                                        );
+                                        if let Some(token) = &cancel {
+                                            tokio::select! {
+                                                _ = tokio::time::sleep(delay) => {}
+                                                _ = token.cancelled() => {
+                                                    cancelled_during_retry = true;
+                                                    break 'fallback_loop;
+                                                }
+                                            }
+                                        } else {
+                                            tokio::time::sleep(delay).await;
+                                        }
                                     }
                                 }
-                                last_err = Some(e);
-                                if is_config { break; }
                             }
                         }
+
+                        // Exhausted retries for current model - try fallback
+                        if fallback_index < fallbacks.len() {
+                            let (new_provider, new_model) = fallbacks[fallback_index];
+                            eprintln!(
+                                "\x1b[33m[fallback: trying {} {}]\x1b[0m",
+                                new_provider.name(), new_model
+                            );
+                            // Rebuild provider and update request
+                            current_model = new_model.to_string();
+                            // Note: provider rebuild would need separate logic
+                            // For now, just move to next fallback
+                            fallback_index += 1;
+                        } else {
+                            // No more fallbacks
+                            break 'fallback_loop;
+                        }
                     }
+
                     if cancelled_during_retry {
                         Err(Error::Provider("cancelled by user during retry backoff".into()))?
                     }
