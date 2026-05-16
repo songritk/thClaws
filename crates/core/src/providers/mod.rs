@@ -1344,3 +1344,195 @@ mod tests {
         );
     }
 }
+
+/// Classification of errors for retry decision-making.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Transient errors that should be retried (timeout, rate limit, 5xx).
+    Transient,
+    /// Network-related errors that may recover (connection refused, DNS).
+    Network,
+    /// Permanent errors that should not be retried (auth failed, invalid request).
+    Permanent,
+}
+
+/// Classify an error message to determine if it should be retried.
+pub fn classify_error(error: &str) -> ErrorClass {
+    let error_lower = error.to_lowercase();
+
+    if error_lower.contains("timeout")
+        || error_lower.contains("timed out")
+        || error_lower.contains("stream idle")
+        || error_lower.contains("idle for")
+    {
+        return ErrorClass::Transient;
+    }
+
+    if error_lower.contains("429")
+        || error_lower.contains("rate limit")
+        || error_lower.contains("too many requests")
+    {
+        return ErrorClass::Transient;
+    }
+
+    if error_lower.contains("500")
+        || error_lower.contains("502")
+        || error_lower.contains("503")
+        || error_lower.contains("504")
+        || error_lower.contains("internal server error")
+        || error_lower.contains("bad gateway")
+        || error_lower.contains("service unavailable")
+        || error_lower.contains("gateway timeout")
+    {
+        return ErrorClass::Transient;
+    }
+
+    if error_lower.contains("connection refused")
+        || error_lower.contains("connection reset")
+        || error_lower.contains("connection timed out")
+        || error_lower.contains("dns")
+        || error_lower.contains("network")
+        || error_lower.contains("no route to host")
+        || error_lower.contains("socket")
+    {
+        return ErrorClass::Network;
+    }
+
+    if error_lower.contains("401")
+        || error_lower.contains("403")
+        || error_lower.contains("invalid api key")
+        || error_lower.contains("authentication")
+        || error_lower.contains("unauthorized")
+    {
+        return ErrorClass::Permanent;
+    }
+
+    if error_lower.contains("400")
+        || error_lower.contains("bad request")
+        || error_lower.contains("invalid request")
+        || error_lower.contains("validation")
+    {
+        return ErrorClass::Permanent;
+    }
+
+    if error_lower.contains("402")
+        || error_lower.contains("credits")
+        || error_lower.contains("insufficient credits")
+        || error_lower.contains("billing")
+    {
+        return ErrorClass::Permanent;
+    }
+
+    if error_lower.contains("stream: error decoding")
+        || error_lower.contains("parse error")
+        || error_lower.contains("invalid response")
+    {
+        return ErrorClass::Transient;
+    }
+
+    ErrorClass::Transient
+}
+
+/// Calculate timeout for a given attempt number.
+/// Escalates: 120s -> 240s -> 480s
+pub fn calculate_timeout(attempt: u32) -> std::time::Duration {
+    let base = 120u64;
+    let timeout = base * 2u64.pow(attempt.min(2));
+    std::time::Duration::from_secs(timeout)
+}
+
+/// Calculate exponential backoff delay for a given attempt number.
+/// Escalates: 30s -> 60s -> 120s
+pub fn calculate_backoff(attempt: u32) -> std::time::Duration {
+    let base = 30u64;
+    let delay = base * 2u64.pow(attempt.min(2));
+    std::time::Duration::from_secs(delay)
+}
+
+/// Get fallback model chain for retry scenarios.
+/// Tries: Anthropic -> OpenAI -> Gemini -> Ollama
+pub fn get_fallback_models(current_model: &str) -> Vec<(ProviderKind, &'static str)> {
+    let current_kind = ProviderKind::detect(current_model);
+
+    let mut fallbacks: Vec<(ProviderKind, &str)> = Vec::new();
+
+    if current_kind != Some(ProviderKind::Anthropic) {
+        fallbacks.push((ProviderKind::Anthropic, "claude-sonnet-4-6"));
+    }
+    if current_kind != Some(ProviderKind::OpenAI) {
+        fallbacks.push((ProviderKind::OpenAI, "gpt-4o-mini"));
+    }
+    if current_kind != Some(ProviderKind::Gemini) {
+        fallbacks.push((ProviderKind::Gemini, "gemini-2.5-flash"));
+    }
+    if current_kind != Some(ProviderKind::Ollama) {
+        fallbacks.push((ProviderKind::Ollama, "ollama/llama3.2"));
+    }
+
+    fallbacks
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_error_timeout() {
+        assert_eq!(classify_error("stream idle for 120s"), ErrorClass::Transient);
+        assert_eq!(classify_error("connection timeout"), ErrorClass::Transient);
+        assert_eq!(classify_error("request timed out"), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn test_classify_error_5xx() {
+        assert_eq!(classify_error("http 500 internal server error"), ErrorClass::Transient);
+        assert_eq!(classify_error("http 503 service unavailable"), ErrorClass::Transient);
+        assert_eq!(classify_error("http 502 bad gateway"), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn test_classify_error_network() {
+        assert_eq!(classify_error("connection refused"), ErrorClass::Network);
+        assert_eq!(classify_error("no route to host"), ErrorClass::Network);
+        assert_eq!(classify_error("dns resolution failed"), ErrorClass::Network);
+    }
+
+    #[test]
+    fn test_classify_error_permanent() {
+        assert_eq!(classify_error("http 401 unauthorized"), ErrorClass::Permanent);
+        assert_eq!(classify_error("invalid api key"), ErrorClass::Permanent);
+        assert_eq!(classify_error("http 400 bad request"), ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn test_calculate_timeout_progression() {
+        assert_eq!(calculate_timeout(0), std::time::Duration::from_secs(120));
+        assert_eq!(calculate_timeout(1), std::time::Duration::from_secs(240));
+        assert_eq!(calculate_timeout(2), std::time::Duration::from_secs(480));
+        assert_eq!(calculate_timeout(3), std::time::Duration::from_secs(480));
+    }
+
+    #[test]
+    fn test_calculate_backoff_progression() {
+        assert_eq!(calculate_backoff(0), std::time::Duration::from_secs(30));
+        assert_eq!(calculate_backoff(1), std::time::Duration::from_secs(60));
+        assert_eq!(calculate_backoff(2), std::time::Duration::from_secs(120));
+        assert_eq!(calculate_backoff(3), std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_get_fallback_models_anthropic() {
+        let fallbacks = get_fallback_models("claude-sonnet-4-6");
+        assert!(fallbacks.iter().any(|(k, _)| *k == ProviderKind::OpenAI));
+        assert!(fallbacks.iter().any(|(k, _)| *k == ProviderKind::Gemini));
+        assert!(fallbacks.iter().any(|(k, _)| *k == ProviderKind::Ollama));
+        assert!(!fallbacks.iter().any(|(k, _)| *k == ProviderKind::Anthropic));
+    }
+
+    #[test]
+    fn test_get_fallback_models_openai() {
+        let fallbacks = get_fallback_models("gpt-4o");
+        assert!(fallbacks.iter().any(|(k, _)| *k == ProviderKind::Anthropic));
+        assert!(!fallbacks.iter().any(|(k, _)| *k == ProviderKind::OpenAI));
+    }
+}

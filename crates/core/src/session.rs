@@ -2076,3 +2076,65 @@ mod tests {
         assert_eq!(contents, "existing line\n");
     }
 }
+
+/// State saved when a streaming request fails, enabling resume on retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialTurnState {
+    pub turn_index: usize,
+    pub messages: Vec<Message>,
+    pub accumulated_text: String,
+    pub error: String,
+}
+
+impl PartialTurnState {
+    pub fn new(turn_index: usize, messages: Vec<Message>, accumulated_text: String, error: String) -> Self {
+        Self {
+            turn_index,
+            messages,
+            accumulated_text,
+            error,
+        }
+    }
+}
+
+/// Save partial turn state to session file for recovery on retry.
+pub fn save_partial_turn(session_path: &Path, state: &PartialTurnState) -> Result<()> {
+    let event = serde_json::json!({
+        "type": "partial_turn",
+        "turn_index": state.turn_index,
+        "messages": state.messages,
+        "accumulated_text": state.accumulated_text,
+        "error": state.error,
+        "timestamp": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    });
+    let line = serde_json::to_string(&event).map_err(|e| Error::Config(format!("serialize partial: {e}")))?;
+    append_locked(session_path, |f| writeln!(f, "{line}")).map_err(Error::from)
+}
+
+/// Load partial turn state from session file (returns most recent one).
+pub fn load_partial_turn(session_path: &Path) -> Result<Option<PartialTurnState>> {
+    let file = File::open(session_path)?;
+    let reader = BufReader::new(file);
+    let mut partial: Option<PartialTurnState> = None;
+
+    for line in reader.lines() {
+        let line = line.map_err(Error::from)?;
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+            if event.get("type").and_then(|v| v.as_str()) == Some("partial_turn") {
+                partial = Some(PartialTurnState {
+                    turn_index: event.get("turn_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                    messages: serde_json::from_value(
+                        event.get("messages").cloned().unwrap_or(serde_json::Value::Array(vec![]))
+                    ).unwrap_or_default(),
+                    accumulated_text: event.get("accumulated_text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    error: event.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(partial)
+}
