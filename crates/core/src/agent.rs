@@ -1154,13 +1154,10 @@ impl Agent {
                         if fallback_index < fallbacks.len() {
                             let (new_provider, new_model) = fallbacks[fallback_index];
                             eprintln!(
-                                "\x1b[33m[fallback: trying {} {}]\x1b[0m",
+                                "\x1b[33m[fallback: trying {} {} (set_rebuild_provider to enable switch)]\x1b[0m",
                                 new_provider.name(), new_model
                             );
-                            // Rebuild provider and update request
                             current_model = new_model.to_string();
-                            // Note: provider rebuild would need separate logic
-                            // For now, just move to next fallback
                             fallback_index += 1;
                         } else {
                             // No more fallbacks
